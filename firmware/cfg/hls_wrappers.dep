@@ -1,0 +1,3 @@
+src --vhdl2008 PuppiMETxy_Wrapped.vhd
+src --vhdl2008 PxPyToPtPhi_Wrapped.vhd
+src --vhdl2008 MetFormat_Wrapped.vhd

@@ -1,0 +1,10 @@
+include -c jetmet/puppimet/METControl METControl.dep
+include hls_wrappers.dep
+include -c jetmet/puppimet/PuppiMETxy PuppiMETxy.dep
+include -c jetmet/puppimet/PxPyToPtPhi PxPyToPtPhi.dep
+include -c jetmet/puppimet/MetFormat MetFormat.dep
+include -c jetmet/puppimet/RUFL/METCtrlToken METCtrlToken.dep
+
+include -c l2-deregionizer/RUFL/DeregionizerCtrlToken DeregionizerCtrlToken.dep
+include -c l2-deregionizer/RUFL/IO IO.dep
+include -c l2-deregionizer/RUFL/Int Int.dep
