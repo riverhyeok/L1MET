@@ -15,7 +15,7 @@ phi_t phi2_edges[NPOINT+1] = {-720, -630, -540, -450, -360, -270, -180, -90, 0, 
 
 // [Helper 1] 1개 입자 변환
 void Get_xy(Particle_T in_particles, Particle_xy &proj_xy) {
-    #pragma HLS pipeline
+    #pragma HLS inline
     if (in_particles.hwPt == 0) {
         proj_xy.hwPx = 0; proj_xy.hwPy = 0; return;
     }
@@ -102,14 +102,14 @@ void Sum_Particles(Particle_xy proj_xy[N_INPUT_LINKS],
 }
 
 // [TOP MODULE]
-void puppimet_xy(hls::stream<Particle_T> in_particles[N_INPUT_LINKS], 
+void puppimet_xy(hls::stream<Particle_T,2> in_particles[N_INPUT_LINKS], 
                  Particle_xy &met_xy, 
                  METCtrlToken token_d, 
                  METCtrlToken& token_q) {
   
     // 인터페이스 설정
-    #pragma HLS INTERFACE axis port=in_particles
-    #pragma HLS STREAM variable=in_particles depth=2
+    #pragma HLS INTERFACE ap_fifo port=in_particles
+
     #pragma HLS INTERFACE ap_none port=met_xy
     
     // [중요] Token 구조체를 비트 단위로 패킹 (3비트)
