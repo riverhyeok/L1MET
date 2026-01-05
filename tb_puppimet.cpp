@@ -1,268 +1,220 @@
-#include <iostream>
-#include <fstream>
-#include <vector>
-#include <string>
-#include <sstream>
-#include <iomanip>
-#include <cmath>
 #include <cassert>
-#include <algorithm>
-#include <hls_stream.h>
+#include <cmath>
+#include <cstdio>
+#include <iostream>
+#include <vector>
+#include <numeric>
+#include "utils/rufl_io.h"
 #include "firmware/puppimet.h"
 
-// RUFL IO는 사용하지 않고 직접 파싱합니다.
-// #include "utils/rufl_io.h" 
+// -------------------------------
+// Configs
+// -------------------------------
+#ifndef N_INPUT_LINKS
+#define N_INPUT_LINKS 36
+#endif
+
+#ifndef N_FRAMES
+#define N_FRAMES 54
+#endif
 
 #ifndef NEVENTS
 #define NEVENTS 5
 #endif
 
-// 디버그 출력 제어 (1: 켜기, 0: 끄기)
-#define DEBUG_INPUT_LOG 1
-
-// Phi Scale Factor (HLS와 동일)
-const double MET_PHI_SCALE = 229.29936;
-
-// ---------------------------------------------------------
-// [Helper] Hex String -> ap_uint<64>
-// ---------------------------------------------------------
-ap_uint<64> hex_to_uint64(std::string hex_str) {
-    if (hex_str.find("0x") == 0 || hex_str.find("0X") == 0) hex_str = hex_str.substr(2);
-    if (hex_str.empty()) return 0;
-    
-    ap_uint<64> val = 0;
-    std::stringstream ss;
-    ss << std::hex << hex_str;
-    uint64_t temp = 0;
-    ss >> temp;
-    val = temp;
-    return val;
+// -------------------------------
+// Mean
+// -------------------------------
+double mean(const std::vector<double>& v) {
+    if (v.empty()) return 0;
+    double s = std::accumulate(v.begin(), v.end(), 0.0);
+    return s / v.size();
 }
 
-// ---------------------------------------------------------
-// [Helper] Unpack Input Particle (64bit -> Particle_T)
-// ---------------------------------------------------------
-void unpack_input_particle(ap_uint<64> packed, Particle_T& p) {
-    if (packed == 0) {
-        p.hwPt = 0; p.hwEta = 0; p.hwPhi = 0;
-        return;
-    }
-    // L1T Standard Format Assumption:
-    // Pt [0:13] (14bits)
-    // Eta [14:25] (12bits) 
-    // Phi [26:36] (11bits) 
-    p.hwPt  = packed.range(13, 0);
-    p.hwEta = packed.range(25, 14);
-    p.hwPhi = packed.range(36, 26);
+// -------------------------------
+// Stddev
+// -------------------------------
+double stddev(const std::vector<double>& v) {
+    if (v.size() < 2) return 0;
+    double m = mean(v);
+    double acc = 0;
+    for (double x : v) acc += (x - m)*(x - m);
+    return std::sqrt(acc / (v.size() - 1));
 }
 
-// ---------------------------------------------------------
-// [Helper] Unpack Reference Sum (64bit -> Sum Struct)
-// ---------------------------------------------------------
-struct RefSum {
-    ap_uint<14> hwPt;    
-    ap_uint<11> hwPhi;   
-    ap_uint<14> hwSumPt; 
-    
-    double getFloatPt() { return hwPt.to_double(); }
-    double getFloatPhi() { return hwPhi.to_double() / MET_PHI_SCALE; }
-};
 
-void unpack_reference_sum(ap_uint<64> packed, RefSum& s) {
-    // Sum struct packing order (LSB First): hwPt -> hwPhi -> hwSumPt
-    s.hwPt    = packed.range(13, 0);
-    s.hwPhi   = packed.range(24, 14); 
-    s.hwSumPt = packed.range(38, 25);
-}
-
-// ---------------------------------------------------------
-// [Helper] Hardware Phi -> Float Radian
-// ---------------------------------------------------------
-double getFloatPhi(phi_t hwPhi) {
-    return hwPhi.to_double() / MET_PHI_SCALE;
-}
-
-// ---------------------------------------------------------
-// [Helper] File Parser
-// ---------------------------------------------------------
-std::vector<ap_uint<64>> parse_file(const char* filename, bool is_reference = false) {
-    std::vector<ap_uint<64>> data;
-    std::ifstream inFile(filename);
-    if (!inFile.is_open()) {
-        std::cerr << "Error: Could not open " << filename << std::endl;
-        return data;
-    }
-
-    std::string line;
-    while(std::getline(inFile, line)) {
-        if (line.empty()) continue;
-        std::stringstream ss(line);
-        std::string s_clk, s_idx, s_data;
-        
-        ss >> s_clk;
-        // 헤더(문자열) 스킵
-        if (!isdigit(s_clk[0])) continue;
-        
-        ss >> s_idx >> s_data;
-        if (s_data.empty()) continue;
-        
-        data.push_back(hex_to_uint64(s_data));
-    }
-    inFile.close();
-    return data;
-}
-
+// =============================================================
+// Main Testbench
+// =============================================================
 int main() {
-    std::cout << "\n===================================================================" << std::endl;
-    std::cout << "   L1 MET Ultimate Testbench: SW vs HLS vs Reference" << std::endl;
-    std::cout << "===================================================================\n" << std::endl;
+    std::cout << "\nStart L1 MET Testbench (Deregionizer Input Mode)\n" << std::endl;
 
-    // 1. Load Data
-    std::cout << ">> Loading Inputs..." << std::endl;
-    std::vector<ap_uint<64>> input_data_packed = parse_file("DeregionizerIn.txt");
-    
-    std::cout << ">> Loading Reference..." << std::endl;
-    std::vector<ap_uint<64>> ref_data_packed = parse_file("METsOut.txt", true);
-
-    std::cout << "   - Input Lines: " << input_data_packed.size() << std::endl;
-    std::cout << "   - Ref Lines  : " << ref_data_packed.size() << " (Expected events)" << std::endl;
-
-    // 2. Simulation Setup
-    int total_frames = N_FRAMES; // 54
-    int links = N_INPUT_LINKS;   // 36
-    int entries_per_event = total_frames * links; // 1944
-
-    // 이벤트 수 결정
-    int events_to_run = std::min((int)ref_data_packed.size(), NEVENTS);
-    
-    if ((long long)events_to_run * entries_per_event > (long long)input_data_packed.size()) {
-        std::cout << "!! WARNING: Not enough input data. Adjusting event count." << std::endl;
-        events_to_run = input_data_packed.size() / entries_per_event;
+    // --------------------------------------------------------
+    // Load input particles
+    // --------------------------------------------------------
+    std::vector<std::vector<PuppiObj>> input_clocks;
+    FILE* deregioFile = fopen("DeregionizerIn.txt", "r");
+    if (deregioFile != NULL) {
+        read_rufl_file<PuppiObj>(deregioFile, input_clocks, false);
+        fclose(deregioFile);
+    } else {
+        std::cerr << "Error: Could not open DeregionizerIn.txt\n";
+        return -1;
     }
 
-    // 3. Main Event Loop
-    for (int iEvent = 0; iEvent < events_to_run; ++iEvent) {
-        std::cout << "\n--- Event " << iEvent << " ---" << std::endl;
+    // --------------------------------------------------------
+    // Load reference MET
+    // --------------------------------------------------------
+    std::vector<std::vector<Sum>> met_ref;
+    FILE* refFile = fopen("METsOut.txt", "r");
+    if (refFile != NULL) {
+        read_rufl_file<Sum>(refFile, met_ref, false);
+        fclose(refFile);
+    } else {
+        std::cerr << "Error: Could not open METsOut.txt\n";
+        return -1;
+    }
 
-        // Variables for Comparison
-        double sw_px = 0.0, sw_py = 0.0;
-        int sw_valid_cnt = 0;
+    int n_Matched = 0;
+    int n_Unmatched = 0;
 
-        hls::stream<Particle_T> in_streams[N_INPUT_LINKS];
-        Particle_xy hls_xy_res;
-        METCtrlToken token_d = {0,0,0}, token_q;
-        Sum hw_met; // HLS Final Result
+    // --------------------------------------------------------
+    // Statistics accumulation
+    // --------------------------------------------------------
+    std::vector<double> diff_pt_list;
+    std::vector<double> diff_phi_list;
+    std::vector<double> hls_pt_list;
+    std::vector<double> hls_phi_list;
 
-        // ----------------------------------------------------
-        // Frame Loop (54 Clocks)
-        // ----------------------------------------------------
-        for (int frame = 0; frame < N_FRAMES; ++frame) {
-            
-            #if DEBUG_INPUT_LOG
-                std::cout << " [Clk " << std::setw(2) << frame << "] In: ";
-                bool has_data = false;
-            #endif
 
-            for (int link = 0; link < N_INPUT_LINKS; ++link) {
-                long long idx = ((long long)iEvent * entries_per_event) + (frame * N_INPUT_LINKS) + link;
-                
-                ap_uint<64> packed_val = 0;
-                if (idx < input_data_packed.size()) packed_val = input_data_packed[idx];
-                
-                Particle_T p;
-                unpack_input_particle(packed_val, p);
+#ifdef MET_WRITE_TB_FILE
+    FILE* HLS_MET_File = fopen("HLS_MET.txt", "w");
+#endif
 
-                // [Debug Log] (Link:Hex)
-                #if DEBUG_INPUT_LOG
-                    if (packed_val != 0) {
-                        std::cout << "(" << link << ":0x" 
-                                  << std::uppercase << std::hex << packed_val << std::dec 
-                                  << ") ";
-                        has_data = true;
-                    }
-                #endif
+    // =========================================================
+    // Event Loop
+    // =========================================================
+    for (int iEvent = 0; iEvent < NEVENTS; iEvent++) {
+        std::cout << "Event " << iEvent << " Processing..." << std::endl;
 
-                // [SW Calc] Accumulate valid particles
-                if (p.hwPt > 0) {
-                    double pt  = p.hwPt.to_double();
-                    double phi = getFloatPhi(p.hwPhi); // HW Unit -> Radian
-                    sw_px -= pt * std::cos(phi);
-                    sw_py -= pt * std::sin(phi);
-                    sw_valid_cnt++;
+        double sw_px = 0;
+        double sw_py = 0;
+
+        Particle_xy met_xy_out;
+        Sum hw_met_final;
+        METCtrlToken token_d, token_q;
+
+        // =====================================================
+        // Frame Loop (54 clocks)
+        // =====================================================
+        for (int iFrame = 0; iFrame < N_FRAMES; iFrame++) {
+            int gclk = iEvent * N_FRAMES + iFrame;
+            if (gclk >= input_clocks.size()) break;
+
+            Particle_T arr[N_INPUT_LINKS];
+            auto &slice = input_clocks[gclk];
+
+            for (int k = 0; k < N_INPUT_LINKS; k++) {
+                if (k < slice.size()) {
+                    arr[k].hwPt  = slice[k].hwPt;
+                    arr[k].hwEta = slice[k].hwEta;
+                    arr[k].hwPhi = slice[k].hwPhi;
+                } else {
+                    arr[k].hwPt  = 0;
+                    arr[k].hwEta = 0;
+                    arr[k].hwPhi = 0;
                 }
 
-                // [HLS Input]
-                in_streams[link].write(p);
+                if (arr[k].hwPt > 0) {
+                    double pt = arr[k].hwPt.to_float();
+                    double phi = floatPhi(arr[k].hwPhi);
+                    sw_px -= pt * cos(phi);
+                    sw_py -= pt * sin(phi);
+                }
             }
-            
-            #if DEBUG_INPUT_LOG
-                if(!has_data) std::cout << "(All 0)";
-                std::cout << std::endl;
-            #endif
-            
-            // Execute DUT
-            puppimet_xy(in_streams, hls_xy_res, token_d, token_q);
+
+            puppimet_xy(arr, met_xy_out, token_d, token_q);
         }
 
-        // ----------------------------------------------------
-        // Post-Processing
-        // ----------------------------------------------------
-        
-        // 1. SW Finalize
-        double sw_pt  = std::hypot(sw_px, sw_py);
-        double sw_phi = std::atan2(sw_py, sw_px);
+        // =====================================================
+        // Convert HLS XY → PT/PHI
+        // =====================================================
+        pxpy_to_ptphi(met_xy_out, hw_met_final, token_d, token_q);
 
-        // 2. HLS Output Conversion (XY -> PtPhi)
-        double hls_px = hls_xy_res.hwPx.to_double();
-        double hls_py = hls_xy_res.hwPy.to_double();
-        double hls_pt_raw = std::hypot(hls_px, hls_py);
-        double hls_phi_rad = std::atan2(hls_py, hls_px);
-        
-        hw_met.hwPt  = pt_t(hls_pt_raw);
-        hw_met.hwPhi = phi_t(hls_phi_rad * MET_PHI_SCALE);
+        double hls_pt = hw_met_final.hwPt.to_float();
+        double hls_phi = floatPhi(hw_met_final.hwPhi);
 
-        // 3. Reference Unpack
-        RefSum ref;
-        unpack_reference_sum(ref_data_packed[iEvent], ref);
+        double sw_pt = hypot(sw_px, sw_py);
+        double sw_phi = atan2(sw_py, sw_px);
 
-        // ----------------------------------------------------
-        // Reporting
-        // ----------------------------------------------------
-        std::cout << std::fixed << std::setprecision(4);
-        std::cout << "          |      Pt     |  Phi (Rad)  |  Phi (Raw)" << std::endl;
-        std::cout << "----------+-------------+-------------+------------" << std::endl;
-        
-        // SW
-        std::cout << "SW Calc   | " << std::setw(11) << sw_pt 
-                  << " | " << std::setw(11) << sw_phi 
-                  << " | " << std::setw(10) << (int)(sw_phi * MET_PHI_SCALE) 
-                  << " (Valid Parts: " << sw_valid_cnt << ")" << std::endl;
+        // --------------------
+        // Add statistics
+        // --------------------
+        hls_pt_list.push_back(hls_pt);
+        hls_phi_list.push_back(hls_phi);
 
-        // HLS
-        std::cout << "HLS Output| " << std::setw(11) << hw_met.hwPt.to_double() 
-                  << " | " << std::setw(11) << getFloatPhi(hw_met.hwPhi)
-                  << " | " << std::setw(10) << hw_met.hwPhi.to_int() << std::endl;
+        diff_pt_list.push_back(hls_pt - sw_pt);
+        diff_phi_list.push_back(hls_phi - sw_phi);
 
-        // Reference
-        std::cout << "Reference | " << std::setw(11) << ref.getFloatPt()
-                  << " | " << std::setw(11) << ref.getFloatPhi()
-                  << " | " << std::setw(10) << ref.hwPhi.to_int() << std::endl;
-
-        // Comparison
-        bool pt_match = std::abs(ref.getFloatPt() - hw_met.hwPt.to_double()) < 1.0;
-        
-        std::cout << "\n>> Result: " << (pt_match ? "MATCH" : "MISMATCH") << std::endl;
-        if (!pt_match) {
-            std::cout << "   [Analysis] Pt differs by " << std::abs(ref.getFloatPt() - hw_met.hwPt.to_double()) << std::endl;
-            if (std::abs(sw_pt - hw_met.hwPt.to_double()) > 1.0) {
-                std::cout << "   [Warning] SW also differs from HLS. Check HLS logic or Coefficients." << std::endl;
-            } else if (std::abs(sw_pt - ref.getFloatPt()) > 1.0) {
-                std::cout << "   [Warning] SW matches HLS, but both differ from Reference." << std::endl;
-                std::cout << "             -> Likely Input Bit-Mapping issue or Reference Interpretation issue." << std::endl;
-            }
+        bool isSame = false;
+        if (iEvent < met_ref.size() && !met_ref[iEvent].empty()) {
+            isSame = (met_ref[iEvent][0] == hw_met_final);
         }
-        std::cout << std::endl;
+
+        if (isSame) n_Matched++;
+        else n_Unmatched++;
+
+        // =====================================================
+        // Preserve original per-event output
+        // =====================================================
+        std::cout << "Event " << iEvent << " Result:" << std::endl;
+
+        std::cout << "  [HLS] Pt: " << hls_pt
+                  << " Phi: " << hls_phi << std::endl;
+
+        std::cout << "  [REF] Pt: " 
+                  << met_ref[iEvent][0].hwPt.to_float()
+                  << " Phi: "
+                  << floatPhi(met_ref[iEvent][0].hwPhi)
+                  << std::endl;
+
+        std::cout << "  [SW ] Pt: " << sw_pt
+                  << " Phi: " << sw_phi << std::endl;
+
+        std::cout << "  Match: " << (isSame ? "TRUE" : "FALSE")
+                  << "\n" << std::endl;
+
+
+#ifdef MET_WRITE_TB_FILE
+        std::vector<Sum> evout = {hw_met_final};
+        write_rufl_event(HLS_MET_File, evout, iEvent, "HLS MET Out");
+#endif
     }
+
+#ifdef MET_WRITE_TB_FILE
+    fclose(HLS_MET_File);
+#endif
+
+    // =========================================================
+    // Final summary
+    // =========================================================
+    std::cout << "\nTotal Results:\n";
+    std::cout << "Matched: " << n_Matched << std::endl;
+    std::cout << "Unmatched: " << n_Unmatched << std::endl;
+
+    // =========================================================
+    // Final Statistics Output
+    // =========================================================
+    std::cout << "\n===== MET Statistics =====\n";
+
+    std::cout << "Mean(HLS_pt - SW_pt): " << mean(diff_pt_list) << std::endl;
+    std::cout << "StdDev(HLS_pt - SW_pt): " << stddev(diff_pt_list) << std::endl;
+
+    std::cout << "Mean(HLS_phi - SW_phi): " << mean(diff_phi_list) << std::endl;
+    std::cout << "StdDev(HLS_phi - SW_phi): " << stddev(diff_phi_list) << std::endl;
+
+    std::cout << "StdDev(HLS_pt): " << stddev(hls_pt_list) << std::endl;
+    std::cout << "StdDev(HLS_phi): " << stddev(hls_phi_list) << std::endl;
 
     return 0;
 }
