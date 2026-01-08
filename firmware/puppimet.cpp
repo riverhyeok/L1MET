@@ -13,12 +13,11 @@ poly2_t sin2_par2[NPOINT] = {1.870674613498914e-06, 5.292404012785538e-06, 7.909
 phi_t phi2_edges[NPOINT+1] = {-720, -630, -540, -450, -360, -270, -180, -90, 0, 90, 180, 270, 360, 450, 540, 630, 720};
 
 
-// [Helper 1] 1개 입자 변환
+
 void Get_xy(Particle_T in_particles, Particle_xy &proj_xy) {
+    // This function calculates x, y projection values using 2nd Polynomial interpolation
     #pragma HLS inline
-    if (in_particles.hwPt == 0) {
-        proj_xy.hwPx = 0; proj_xy.hwPy = 0; return;
-    }
+
     
     int phibin = 0;
     if      (in_particles.hwPhi < phi2_edges[1]) phibin = 0;
@@ -44,233 +43,231 @@ void Get_xy(Particle_T in_particles, Particle_xy &proj_xy) {
     proj_xy.hwPy = in_particles.hwPt * sin_var;
 }
 
+void Sum_Particles(Particle_xy proj_xy[N_INPUT_LINKS], Particle_xy &met_xy) {
+    // Sum of maximum 36 vectors in parallel
+  
+    #pragma HLS inline
+  
+    proj_t proj_x[N_INPUT_LINKS];
+    proj_t proj_y[N_INPUT_LINKS];
+    proj_t met_x = 0;
+    proj_t met_y = 0;
+  
+    met_xy.hwPx = 0;
+    met_xy.hwPy = 0;
+  
+    #pragma HLS ARRAY_PARTITION variable=proj_xy complete
+    #pragma HLS ARRAY_PARTITION variable=proj_x complete
+    #pragma HLS ARRAY_PARTITION variable=proj_y complete
+  
+    for(int i=0; i<N_INPUT_LINKS; ++i) {
+      #pragma HLS unroll
+      proj_x[i] = proj_xy[i].hwPx;
+      proj_y[i] = proj_xy[i].hwPy;
+    }
+  
+    CALC_LOOP:
+    for(int i=0; i<N_INPUT_LINKS; ++i) {
+      #pragma HLS unroll
+      // Note: If Proj value has more float bits than metx&y, it makes lots of latency
+      met_xy.hwPx -= proj_x[i];
+      met_xy.hwPy -= proj_y[i];
+    }
+  }
+  
 
-void Sum_Particles(Particle_xy proj_xy[N_INPUT_LINKS], 
-    bool is_valid[N_INPUT_LINKS], // 인자는 유지하되 내부에서 미사용 (호환성)
-    Particle_xy &slice_sum, 
-    ap_uint<6> &valid_cnt) {
-#pragma HLS inline // 상위 함수에 병합되어 최적화
-
-// ------------------------------------------------
-// Stage 1: 36개 입력을 6개 그룹으로 나누어 병렬 덧셈
-// ------------------------------------------------
-proj_t partial_sum_x[6] = {0, 0, 0, 0, 0, 0};
-proj_t partial_sum_y[6] = {0, 0, 0, 0, 0, 0};
-ap_uint<4> partial_cnt[6] = {0, 0, 0, 0, 0, 0};
-
-// 파티셔닝 지시어는 그대로 유지
-#pragma HLS ARRAY_PARTITION variable=proj_xy complete
-#pragma HLS ARRAY_PARTITION variable=is_valid complete
-
-STAGE1_LOOP:
-for(int i=0; i<6; ++i) {
-#pragma HLS UNROLL
-for(int j=0; j<6; ++j) {
-#pragma HLS UNROLL
-int idx = i*6 + j;
-
-// [최적화 1] Copy Loop 제거: 입력 배열에서 바로 더함
-// Get_xy에서 이미 0 처리가 되었으므로 조건문 없이 더해도 안전함
-partial_sum_x[i] += proj_xy[idx].hwPx;
-partial_sum_y[i] += proj_xy[idx].hwPy;
-
-// Valid 카운트는 데이터 의존성이 없으므로 여기서 수행
-if(is_valid[idx]) {
- partial_cnt[i]++;
-}
-}
-}
-
-// ------------------------------------------------
-// Stage 2: 6개의 부분 합을 최종 합산
-// ------------------------------------------------
-proj_t total_x = 0;
-proj_t total_y = 0;
-ap_uint<6> total_cnt = 0;
-
-STAGE2_LOOP:
-for(int i=0; i<6; ++i) {
-#pragma HLS UNROLL
-total_x += partial_sum_x[i];
-total_y += partial_sum_y[i];
-total_cnt += partial_cnt[i];
-}
-
-slice_sum.hwPx = total_x;
-slice_sum.hwPy = total_y;
-valid_cnt = total_cnt;
-}
-
-// ---------------------------------------------------------
-// TOP MODULE
-// ---------------------------------------------------------
-void puppimet_xy(
-    Particle_T      in_particles[N_INPUT_LINKS],   // Stream -> Array 변경
-    Particle_xy    &met_xy,
-    METCtrlToken    token_d,
-    METCtrlToken   &token_q
-) {
-    // -----------------------------------------------------
-    // Interface 설정
-    // -----------------------------------------------------
-    #pragma HLS INTERFACE ap_none port=in_particles
-    #pragma HLS INTERFACE ap_none port=met_xy
-
-    #pragma HLS ARRAY_PARTITION variable=in_particles complete
-
-    // Token interface
-    #pragma HLS INTERFACE ap_none port=token_d
-    #pragma HLS INTERFACE ap_none port=token_q
-    #pragma HLS aggregate variable=token_d compact=bit
-    #pragma HLS aggregate variable=token_q compact=bit
-
+void puppimet_xy(Particle_T in_particles[N_INPUT_LINKS], Particle_xy  &met_xy, METCtrlToken token_d, METCtrlToken &token_q, METCtrlToken token_i) {
+    
     #pragma HLS PIPELINE
 
-    // -----------------------------------------------------
-    // Static Accumulators
-    // -----------------------------------------------------
+    Particle_xy converted_xy[N_INPUT_LINKS];
+
+    #pragma HLS ARRAY_PARTITION variable=in_particles complete
+    #pragma HLS ARRAY_PARTITION variable=converted_xy complete
+
+    #pragma HLS aggregate variable=token_d compact=bit
+    #pragma HLS aggregate variable=token_q compact=bit
+    #pragma HLS aggregate variable=in_particles compact=bit
+    #pragma HLS aggregate variable=met_xy compact=bit
+    
+    #pragma HLS INTERFACE ap_none port=in_particles
+    #pragma HLS INTERFACE ap_none port=met_xy
+    #pragma HLS INTERFACE ap_none port=token_d
+    #pragma HLS INTERFACE ap_none port=token_q
+    #pragma HLS INTERFACE ap_none port=token_i
+
     static proj_t    global_acc_px     = 0;
     static proj_t    global_acc_py     = 0;
-    static ap_uint<6> frame_cnt         = 0;
-    static ap_uint<9> particle_cnt_total = 0;
+    static ap_uint<6> frame_cnt        = 0;
 
-    // -----------------------------------------------------
-    // 1. Read & Convert
-    // -----------------------------------------------------
-    Particle_xy converted_xy[N_INPUT_LINKS];
-    bool        is_valid[N_INPUT_LINKS];
-
-READ_CONVERT_LOOP:
+    READ_CONVERT_LOOP:
     for (int i = 0; i < N_INPUT_LINKS; ++i) {
         #pragma HLS UNROLL
-
-        // Stream → Array 변경: read() 제거
-        Particle_T tmp = in_particles[i];
-
-        Get_xy(tmp, converted_xy[i]);
-        is_valid[i] = (tmp.hwPt > 0);
+        Get_xy(in_particles[i], converted_xy[i]);
     }
 
-    // -----------------------------------------------------
-    // 2. Sum_Particles
-    // -----------------------------------------------------
     Particle_xy slice_sum;
-    ap_uint<6>  slice_valid_cnt;
 
-    Sum_Particles(converted_xy, is_valid, slice_sum, slice_valid_cnt);
-
-    // -----------------------------------------------------
-    // 3. Global Accumulation
-    // -----------------------------------------------------
-    if (particle_cnt_total < MAX_PARTICLES) {
-        global_acc_px      -= slice_sum.hwPx;
-        global_acc_py      -= slice_sum.hwPy;
-        particle_cnt_total += slice_valid_cnt;
-    }
-
-    // -----------------------------------------------------
-    // 4. Output Logic
-    // -----------------------------------------------------
+    Sum_Particles(converted_xy, slice_sum);
+    global_acc_px += slice_sum.hwPx;
+    global_acc_py += slice_sum.hwPy;
     frame_cnt++;
+    met_xy.hwPx = global_acc_px;
+    met_xy.hwPy = global_acc_py;
 
     if (frame_cnt == N_FRAMES) {
-        met_xy.hwPx = global_acc_px;
-        met_xy.hwPy = global_acc_py;
-
         // Reset
         global_acc_px      = 0;
         global_acc_py      = 0;
         frame_cnt          = 0;
-        particle_cnt_total = 0;
+
+        token_i.start_of_orbit = token_d.start_of_orbit;
+        token_i.dataValid = true;
+        token_i.frameValid = true;
     } else {
-        met_xy.hwPx = 0;
-        met_xy.hwPy = 0;
+        token_i.dataValid = false;
+        token_i.frameValid = false;
     }
 
-    // -----------------------------------------------------
-    // 5. Token Pass-through
-    // -----------------------------------------------------
+    token_q = token_i;
+}
+
+static const ap_int<12> VAL_90DEG = 360;
+static const ap_int<12> VAL_180DEG = 720;
+static const int LUT_SIZE = 1024; // Python 코드의 ADDR_BITS=10 일치
+
+void pxpy_to_ptphi(
+    const Particle_xy met_xy,
+    Sum &out_met,
+    METCtrlToken token_d,
+    METCtrlToken& token_q
+) {
+    #pragma HLS PIPELINE II=1
+    
+    // Interface & Aggregation pragmas
+    #pragma HLS aggregate variable=met_xy compact=bit
+    #pragma HLS aggregate variable=out_met compact=bit
+    #pragma HLS aggregate variable=token_d compact=bit
+    #pragma HLS aggregate variable=token_q compact=bit
+
+    #pragma HLS interface ap_none port=met_xy
+    #pragma HLS interface ap_none port=out_met
+    #pragma HLS interface ap_none port=token_d
+    #pragma HLS interface ap_none port=token_q
+
+    // LUT를 BRAM이나 ROM으로 지정 (Resource 관리)
+    #pragma HLS BIND_STORAGE variable=LUT_ATAN2_SCALED type=rom_1p impl=auto
+    #pragma HLS BIND_STORAGE variable=LUT_HYPOT_SCALE type=rom_1p impl=auto
+
+    // ---------------------------------------------------------
+    // 1. 절대값 변환 (Unsigned Fixed Point로 변환하여 처리)
+    // ---------------------------------------------------------
+    // proj_t는 ap_fixed<22, 12>입니다.
+    // 절대값을 취하기 위해 부호를 제거합니다.
+    proj_t px = met_xy.hwPx;
+    proj_t py = met_xy.hwPy;
+
+    // 부호 비트 저장
+    bool sign_x = (px < 0);
+    bool sign_y = (py < 0);
+
+    // 절대값 취득 (비트 조작 없이 수식적으로 처리, HLS가 최적화함)
+    // 계산 정밀도 확보를 위해 ufixed로 캐스팅하여 연산 준비
+    ap_ufixed<22, 12> abs_x = (sign_x) ? (ap_ufixed<22, 12>)(-px) : (ap_ufixed<22, 12>)px;
+    ap_ufixed<22, 12> abs_y = (sign_y) ? (ap_ufixed<22, 12>)(-py) : (ap_ufixed<22, 12>)py;
+
+    // ---------------------------------------------------------
+    // 2. 8분면 매핑 (Octant Mapping) -> 0~45도 영역으로 변환
+    // ---------------------------------------------------------
+    ap_ufixed<22, 12> max_val, min_val;
+    bool xy_swapped = false;
+
+    if (abs_y > abs_x) {
+        max_val = abs_y;
+        min_val = abs_x;
+        xy_swapped = true; // 45~90도 영역임
+    } else {
+        max_val = abs_x;
+        min_val = abs_y;
+        xy_swapped = false; // 0~45도 영역임
+    }
+
+    // ---------------------------------------------------------
+    // 3. LUT 인덱스 계산 (나눗셈 1회 수행)
+    // ---------------------------------------------------------
+    // Index = (min / max) * 1024
+    // 정밀도를 위해 min을 먼저 Shift하고 나눕니다.
+    // LUT_SIZE가 1024(10비트)이므로 << 10
+    
+    ap_uint<10> lut_idx = 0;
+    
+    // max_val이 0이면(입력이 0,0) 인덱스 0, 결과도 0
+    if (max_val > 0) {
+        // ap_ufixed 나눗셈. 분자가 더 커야 소수점 아래 정보가 유지됨.
+        // 분자: 22bit + 10bit shift = 32bit.
+        // 결과가 10bit 정수 범위에 들어오도록 설정.
+        // HLS 나눗셈기 최적화를 위해 명시적 캐스팅 권장
+        ap_ufixed<32, 22> num = min_val; 
+        num = num << 10; // * 1024
+        
+        ap_ufixed<10, 10> ratio = num / max_val;
+        
+        // 인덱스 클램핑 (혹시 모를 오버플로우 방지)
+        if (ratio >= LUT_SIZE) lut_idx = LUT_SIZE - 1;
+        else lut_idx = ratio;
+    }
+
+    // ---------------------------------------------------------
+    // 4. Look-Up Table 조회
+    // ---------------------------------------------------------
+    // LUT 데이터 타입은 생성한 헤더파일과 일치해야 합니다.
+    // 예: LUT_HYPOT_SCALE은 ap_ufixed<18, 2> 가정
+    // 예: LUT_ATAN2_SCALED는 ap_uint<10> 가정
+    
+    auto scale_factor = LUT_HYPOT_SCALE[lut_idx];
+    auto phi_base     = LUT_ATAN2_SCALED[lut_idx];
+
+    // ---------------------------------------------------------
+    // 5. Pt 계산 (Hypotenuse)
+    // ---------------------------------------------------------
+    // Pt = Max * sqrt(1 + (min/max)^2)
+    // 결과 타입 pt_t (14, 12)에 맞춰 포화(Saturation) 처리됨
+    // 곱셈 결과가 pt_t보다 클 수 있으므로 중간 변수 사용
+    ap_ufixed<30, 14> pt_calc = max_val * scale_factor;
+    out_met.hwPt = (pt_t)pt_calc;
+    out_met.hwSumPt = 0; // SumPt는 여기서 계산 안하면 0 또는 패스스루
+
+    // ---------------------------------------------------------
+    // 6. Phi 계산 (복원 과정)
+    // ---------------------------------------------------------
+    ap_int<12> phi_temp; // 계산용 넉넉한 비트 (최대 720)
+
+    // A. Swap 복원 (0~90도 생성)
+    if (xy_swapped) {
+        // 45~90도 영역이었으므로, 90도에서 뺌
+        phi_temp = VAL_90DEG - phi_base;
+    } else {
+        phi_temp = phi_base;
+    }
+
+    // B. X축 대칭 복원 (0~180도 생성)
+    if (sign_x) {
+        // 2, 3사분면 (X < 0) -> 180도에서 뺌
+        phi_temp = VAL_180DEG - phi_temp;
+    }
+
+    // C. Y축 대칭 복원 (-180 ~ +180도 생성)
+    // Y가 음수면 전체 각도에 마이너스 (3, 4사분면)
+    if (sign_y) {
+        phi_temp = -phi_temp;
+    }
+
+    // 최종 할당 (phi_t는 ap_int<11>이므로 캐스팅)
+    out_met.hwPhi = (phi_t)phi_temp;
+
+    // ---------------------------------------------------------
+    // Token 전달
+    // ---------------------------------------------------------
+    out_met.hwSumPt = 0; // 필요시 연결
     token_q = token_d;
 }
-
-// CORDIC 설정
-#define NUM_ITER 20 // 20번 반복이면 26비트 정밀도에 충분
-// CORDIC Gain (1.64676...)의 역수 = 0.607252935
-const ap_fixed<26, 2> CORDIC_GAIN = 0.60725; 
-
-// [최적화 핵심] 
-// atan(2^-i) 값들에 미리 229.29936을 곱해둔 테이블입니다.
-// 이렇게 하면 나중에 229.xx를 곱하는 DSP 연산을 제거할 수 있습니다.
-// 값 예시: atan(1)*229.3, atan(0.5)*229.3 ...
-const ap_fixed<26, 11> ANGLES_SCALED[NUM_ITER] = {
-    180.091, 106.315, 56.177, 28.514, 14.336, 7.181, 3.593, 1.797, 
-    0.898, 0.449, 0.225, 0.112, 0.056, 0.028, 0.014, 0.007,
-    0.003, 0.002, 0.001, 0.000 // (실제로는 더 정밀하게 계산해서 넣어야 함)
-};
-
-void pxpy_to_ptphi(const Particle_xy met_xy, Sum &out_met, METCtrlToken token_d, METCtrlToken& token_q) {
-  #pragma HLS PIPELINE
-  // II=54를 명시하면 HLS가 리소스를 최대한 공유해서 회로를 작게 만듭니다.
-  
-  // 기존 인터페이스 유지
-  #pragma HLS aggregate variable=met_xy compact=bit
-  #pragma HLS aggregate variable=out_met compact=bit
-  // ... (나머지 인터페이스 유지)
-
-  // 1. 좌표 초기화
-  // CORDIC은 1, 4사분면(x > 0)에서 동작하므로 미리 매핑이 필요할 수 있으나,
-  // Full Quadrant CORDIC은 초기 회전으로 처리 가능합니다.
-  // 여기서는 간단히 x, y, z(angle)로 시작합니다.
-  
-  ap_fixed<26, 11> x = met_xy.hwPx;
-  ap_fixed<26, 11> y = met_xy.hwPy;
-  ap_fixed<26, 11> z = 0; // 이것이 나중에 hwPhi가 됩니다.
-  
-  // 1-1. 초기 사분면 보정 (x가 음수일 때 처리)
-  // CORDIC 수렴 범위를 위해 x를 양수로 만듭니다.
-  // x < 0 이면 180도(pi) 회전 효과를 줍니다.
-  // 여기서는 스케일링된 180도 = 3.14159 * 229.29936 = 약 720.4
-  ap_fixed<26, 11> pi_scaled = 720.407; 
-  
-  if (x < 0) {
-      x = -x;
-      y = -y;
-      if (met_xy.hwPy < 0) z = -pi_scaled;
-      else z = pi_scaled;
-  }
-
-  // 2. Iterative CORDIC Loop
-  CORDIC_LOOP:
-  for (int i = 0; i < NUM_ITER; i++) {
-    #pragma HLS PIPELINE off 
-
-
-    ap_fixed<26, 11> x_new, y_new, z_new;
-    ap_fixed<26, 11> shift_x = x >> i; // 비트 시프트 (나눗셈 대체)
-    ap_fixed<26, 11> shift_y = y >> i;
-
-    bool sign = (y < 0); // y를 0으로 만드는 것이 목표 (Vectoring Mode)
-
-    if (!sign) { // y가 양수면 시계방향 회전
-        x_new = x + shift_y;
-        y_new = y - shift_x;
-        z_new = z + ANGLES_SCALED[i]; // 미리 스케일된 각도 더함
-    } else { // y가 음수면 반시계방향 회전
-        x_new = x - shift_y;
-        y_new = y + shift_x;
-        z_new = z - ANGLES_SCALED[i];
-    }
-
-    x = x_new;
-    y = y_new;
-    z = z_new;
-  }
-
-
-  out_met.hwPt = x * CORDIC_GAIN; 
-  out_met.hwPhi = phi_t(z); // 이미 229.299가 곱해진 상태
-
-  token_q = token_d;
-}
-
-

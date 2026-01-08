@@ -144,11 +144,6 @@ struct METCtrlToken{
     bool dataValid;
     bool frameValid;
 };
-struct SliceResult {
-  proj_t sum_px;
-  proj_t sum_py;
-  ap_uint<6> valid_count;
-};
 
 #endif
 

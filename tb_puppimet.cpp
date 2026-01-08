@@ -7,9 +7,7 @@
 #include "utils/rufl_io.h"
 #include "firmware/puppimet.h"
 
-// -------------------------------
-// Configs
-// -------------------------------
+
 #ifndef N_INPUT_LINKS
 #define N_INPUT_LINKS 36
 #endif
@@ -22,18 +20,13 @@
 #define NEVENTS 5
 #endif
 
-// -------------------------------
-// Mean
-// -------------------------------
+
 double mean(const std::vector<double>& v) {
     if (v.empty()) return 0;
     double s = std::accumulate(v.begin(), v.end(), 0.0);
     return s / v.size();
 }
 
-// -------------------------------
-// Stddev
-// -------------------------------
 double stddev(const std::vector<double>& v) {
     if (v.size() < 2) return 0;
     double m = mean(v);
@@ -43,15 +36,10 @@ double stddev(const std::vector<double>& v) {
 }
 
 
-// =============================================================
-// Main Testbench
-// =============================================================
+
 int main() {
     std::cout << "\nStart L1 MET Testbench (Deregionizer Input Mode)\n" << std::endl;
 
-    // --------------------------------------------------------
-    // Load input particles
-    // --------------------------------------------------------
     std::vector<std::vector<PuppiObj>> input_clocks;
     FILE* deregioFile = fopen("DeregionizerIn.txt", "r");
     if (deregioFile != NULL) {
@@ -62,9 +50,6 @@ int main() {
         return -1;
     }
 
-    // --------------------------------------------------------
-    // Load reference MET
-    // --------------------------------------------------------
     std::vector<std::vector<Sum>> met_ref;
     FILE* refFile = fopen("METsOut.txt", "r");
     if (refFile != NULL) {
@@ -102,7 +87,7 @@ int main() {
 
         Particle_xy met_xy_out;
         Sum hw_met_final;
-        METCtrlToken token_d, token_q;
+        METCtrlToken token_d, token_q, token_i;;
 
         // =====================================================
         // Frame Loop (54 clocks)
@@ -112,7 +97,7 @@ int main() {
             if (gclk >= input_clocks.size()) break;
 
             Particle_T arr[N_INPUT_LINKS];
-            auto &slice = input_clocks[gclk];
+            std::vector<PuppiObj>& slice = input_clocks[gclk];
 
             for (int k = 0; k < N_INPUT_LINKS; k++) {
                 if (k < slice.size()) {
@@ -133,7 +118,7 @@ int main() {
                 }
             }
 
-            puppimet_xy(arr, met_xy_out, token_d, token_q);
+            puppimet_xy(arr, met_xy_out, token_d, token_q, token_i);
         }
 
         // =====================================================
